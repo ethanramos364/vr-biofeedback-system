@@ -1,0 +1,305 @@
+// PhaseScramble.compute
+// Build with a power-of-two size N (e.g., 256 or 512)
+// VR-optimized phase-scrambled texture generation with continuous temporal evolution
+
+#pragma kernel InitRandomPhasor
+#pragma kernel UpdateSpectrum
+#pragma kernel IFFT_Horizontal
+#pragma kernel IFFT_Vertical
+#pragma kernel OutputReal
+#pragma target 5.0
+
+// ---------- CONFIG ----------
+#define N 256                    // <-- set to 256 first; change in both C# and shader
+#define LOGN 8                   // log2(N) e.g., 8 for 256, 9 for 512
+
+// Complex = float2 (x = real, y = imag)
+static float2 cmul(float2 a, float2 b) { return float2(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x); }
+static float2 cexp_i(float phase) { return float2(cos(phase), sin(phase)); }
+static float carg(float2 z) { return atan2(z.y, z.x); }
+static float2 cconj(float2 z) { return float2(z.x, -z.y); }
+
+RWStructuredBuffer<float2> P;          // evolving random phasor field (unit magnitude), size N*N
+RWStructuredBuffer<float2> Spectrum;   // complex spectrum S(k), size N*N
+RWStructuredBuffer<float2> Temp;       // scratch buffer for FFT passes, size N*N
+
+StructuredBuffer<float> Mag;           // A(k) magnitude spectrum (fixed), size N*N
+StructuredBuffer<float> Phi0;          // original phase phi0(k), size N*N (precomputed once)
+
+cbuffer Params
+{
+    float Scramble;      // 0..1
+    float Dx;            // accumulated translation in pixels (can be fractional)
+    float Dy;
+    float FPS;           // stimulus update rate
+    float Tau0;          // seconds (base time constant)
+    float R0;            // frequency scale
+    float Gamma;         // frequency dependency exponent
+    uint  FrameIndex;    // increments each update
+    uint  Seed;
+};
+
+// Map 2D -> linear index
+static uint idx(uint x, uint y) { return y * N + x; }
+
+// FFT frequency grid in cycles/pixel, like numpy.fft.fftfreq
+static float ffreq(uint i)
+{
+    // i in [0..N-1]
+    // 0,1,2,...,N/2,-N/2+1,...,-1 divided by N
+    int ii = (int)i;
+    int half = N / 2;
+    int k = (ii <= half) ? ii : (ii - (int)N);
+    return (float)k / (float)N;
+}
+
+// Frequency-dependent rho = exp(-dt/tau(r))
+// Lower frequencies evolve slowly, higher frequencies evolve faster
+static float rho_from_xy(uint x, uint y)
+{
+    float dt = 1.0 / max(FPS, 1e-3);
+    float fx = ffreq(x);
+    float fy = ffreq(y);
+    float r = sqrt(fx*fx + fy*fy);
+
+    // Frequency-dependent time constant
+    float tau = Tau0 * pow(abs(R0 / (r + R0)), Gamma);
+    tau = max(tau, 1e-4);
+
+    float rho = exp(-dt / tau);
+    return clamp(rho, 0.0, 0.999999);
+}
+
+// Hash -> [0,1) using Jenkins one-at-a-time
+static uint hash_u32(uint v)
+{
+    v ^= v >> 16;
+    v *= 0x7feb352d;
+    v ^= v >> 15;
+    v *= 0x846ca68b;
+    v ^= v >> 16;
+    return v;
+}
+
+static float rand01(uint x, uint y, uint frame, uint seed)
+{
+    uint h = hash_u32(x * 73856093u ^ y * 19349663u ^ frame * 83492791u ^ seed);
+    return (h & 0x00FFFFFFu) / 16777216.0; // 24-bit mantissa
+}
+
+// Enforce Hermitian symmetry for real iFFT output
+// Primary region: y < N/2 OR (y==N/2 AND x<=N/2)
+static bool is_primary(uint x, uint y)
+{
+    uint half = N / 2;
+    if (y < half) return true;
+    if (y == half && x <= half) return true;
+    return false;
+}
+
+// Conjugate frequency index: (-x mod N, -y mod N)
+static uint2 conj_index(uint x, uint y)
+{
+    uint cx = (x == 0) ? 0 : (N - x);
+    uint cy = (y == 0) ? 0 : (N - y);
+    return uint2(cx, cy);
+}
+
+// ---------- KERNELS ----------
+
+// Initialize P with random unit phasors respecting Hermitian symmetry
+[numthreads(8,8,1)]
+void InitRandomPhasor(uint3 tid : SV_DispatchThreadID)
+{
+    uint x = tid.x, y = tid.y;
+    if (x >= N || y >= N) return;
+
+    if (!is_primary(x,y)) return;
+
+    float a = 6.28318530718 * rand01(x, y, 0, Seed);
+    float2 z = cexp_i(a);
+
+    // DC and Nyquist points should be real to preserve symmetry perfectly
+    uint half = N / 2;
+    bool is_edge = ( (x==0 || x==half) && (y==0 || y==half) );
+    if (is_edge) z = float2(1, 0);
+
+    P[idx(x,y)] = z;
+    uint2 c = conj_index(x,y);
+    P[idx(c.x,c.y)] = cconj(z);
+}
+
+// Update Spectrum = A(k) * exp(i*(phi_mix + phi_ramp))
+// where phi_mix is circular mix between phi0 and phir, with scramble parameter.
+[numthreads(8,8,1)]
+void UpdateSpectrum(uint3 tid : SV_DispatchThreadID)
+{
+    uint x = tid.x, y = tid.y;
+    if (x >= N || y >= N) return;
+
+    if (!is_primary(x,y)) return;
+
+    uint i = idx(x,y);
+
+    // Evolve P with frequency-dependent rho
+    // AR(1) update: P_tilde = rho * P + sqrt(1-rho^2) * Q
+    float rho = rho_from_xy(x,y);
+    float a = 6.28318530718 * rand01(x, y, FrameIndex, Seed);
+    float2 Q = cexp_i(a);
+
+    float2 z = rho * P[i] + sqrt(max(1.0 - rho*rho, 0.0)) * Q;
+    z = z / max(length(z), 1e-6); // project back to unit circle
+    P[i] = z;
+
+    // Mirror to conjugate for Hermitian symmetry
+    uint2 c = conj_index(x,y);
+    P[idx(c.x,c.y)] = cconj(z);
+
+    // Build phi_rand from P
+    float phi_r = carg(z);
+
+    // Weighted-mean-phase mixing (angle aware)
+    // This avoids phase wrapping artifacts
+    float s = saturate(Scramble);
+    float2 mixPhasor = (1.0 - s) * cexp_i(Phi0[i]) + s * cexp_i(phi_r);
+    float phi_mix = carg(mixPhasor);
+
+    // Drift ramp: -2π (fx*Dx + fy*Dy)
+    float fx = ffreq(x);
+    float fy = ffreq(y);
+    float phi_ramp = -6.28318530718 * (fx * Dx + fy * Dy);
+
+    float phi = phi_mix + phi_ramp;
+
+    // Special-case DC: keep mean perfectly stable
+    if (x == 0 && y == 0)
+    {
+        Spectrum[i] = float2(Mag[i], 0);
+    }
+    else
+    {
+        Spectrum[i] = Mag[i] * cexp_i(phi);
+    }
+
+    // Mirror Spectrum to enforce Hermitian symmetry
+    Spectrum[idx(c.x,c.y)] = cconj(Spectrum[i]);
+}
+
+// ---------- IFFT (Stockham-style in groupshared memory) ----------
+
+groupshared float2 sharedData[256];
+
+// Bit reversal for FFT
+static uint bit_reverse(uint v)
+{
+    uint r = 0;
+    for (uint i = 0; i < LOGN; i++)
+    {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
+    return r;
+}
+
+// iFFT twiddle factor: exp(+i 2π k / m)
+static float2 twiddle(uint k, uint m)
+{
+    float ang = 6.28318530718 * (float)k / (float)m;
+    return float2(cos(ang), sin(ang));
+}
+
+// Horizontal iFFT: process rows
+// Dispatched as (1, N, 1) — gid.y = row, gtid.x = element within row
+[numthreads(256,1,1)]
+void IFFT_Horizontal(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint x = gtid.x;   // element index within the row (0..N-1)
+    uint y = gid.y;    // row index (0..N-1)
+
+    // Load row with bit-reversed input — all threads always reach this (no early return)
+    uint br = bit_reverse(x);
+    sharedData[x] = Spectrum[idx(br, y)];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Iterative Cooley-Tukey iFFT butterfly stages
+    for (uint s = 1; s <= LOGN; s++)
+    {
+        uint m = 1u << s;
+        uint half = m >> 1;
+        uint j = x % m;
+        uint k = j % half;
+
+        uint block = x - j;
+        uint i0 = block + k;
+        uint i1 = i0 + half;
+
+        float2 a = sharedData[i0];
+        float2 b = sharedData[i1];
+        float2 w = twiddle(k, m);
+        float2 t = cmul(w, b);
+
+        if (j < half)
+            sharedData[x] = a + t;
+        else
+            sharedData[x] = a - t;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Scale by 1/N (1D iFFT normalization)
+    Temp[idx(x, y)] = sharedData[x] / (float)N;
+}
+
+// Vertical iFFT: process columns
+// Dispatched as (1, N, 1) — gid.y = column, gtid.x = element within column
+[numthreads(256,1,1)]
+void IFFT_Vertical(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint col = gid.y;  // column index (0..N-1)
+    uint y   = gtid.x; // element index within the column (0..N-1)
+
+    // Load column from Temp with bit-reversed input — all threads always reach this
+    uint br = bit_reverse(y);
+    sharedData[y] = Temp[idx(col, br)];
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 1; s <= LOGN; s++)
+    {
+        uint m = 1u << s;
+        uint half = m >> 1;
+        uint j = y % m;
+        uint k = j % half;
+
+        uint block = y - j;
+        uint i0 = block + k;
+        uint i1 = i0 + half;
+
+        float2 a = sharedData[i0];
+        float2 b = sharedData[i1];
+        float2 w = twiddle(k, m);
+        float2 t = cmul(w, b);
+
+        if (j < half)
+            sharedData[y] = a + t;
+        else
+            sharedData[y] = a - t;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Scale by 1/N => total normalization is 1/(N*N) for 2D iFFT
+    Spectrum[idx(col, y)] = sharedData[y] / (float)N;
+}
+
+// Write real part to output texture (RFloat)
+RWTexture2D<float> OutTex;
+
+[numthreads(8,8,1)]
+void OutputReal(uint3 tid : SV_DispatchThreadID)
+{
+    uint x = tid.x, y = tid.y;
+    if (x >= N || y >= N) return;
+
+    float val = Spectrum[idx(x,y)].x; // real part
+    OutTex[int2(x,y)] = val;
+}
